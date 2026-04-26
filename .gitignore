@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local config
+.claude/
+
+# Runtime outputs
+yumaoqiu_repro/
+
+# Temporary debugging artifacts
+court_*.png
+court_check*.png
+court_grid.png
+court_guess.png
+court_hint.png
+first_frame.png
+frame_*.png
+tn_*.png
+_check_*.png
+panel_preview.png
+
+# Logs
+*.log
