@@ -1,8 +1,30 @@
 # 羽毛球比赛视频智能分析系统
 
-把一段普通的羽毛球比赛视频，转换成带运动员轨迹、移动速度、累计跑动距离、羽毛球飞行轨迹的可视化分析视频，最后还能加上电影级"子弹时间"特效。
+**简体中文** · [English](README_EN.md)
+
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/pytorch-2.x-ee4c2c.svg)](https://pytorch.org/)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-black.svg)](https://www.apple.com/macos/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ychenfen/badminton-pipeline-repro/pulls)
+
+把一段普通的羽毛球比赛视频，转换成带**运动员轨迹、移动速度、累计跑动距离、羽毛球飞行轨迹**的可视化分析视频，最后还能加上电影级"子弹时间"特效。
 
 整套系统基于 **TrackNet（球检测） + YOLOv8s-pose（球员姿态） + ByteTrack（多目标跟踪） + 透视矫正**，在 Apple Silicon Mac 上跑通过完整流程。
+
+![效果演示](docs/images/demo.gif)
+
+---
+
+## 这个项目解决了什么
+
+市面上"开源羽毛球分析"项目通常只能做以下其中一项：
+- 只检测球，没有球员分析
+- 假设俯视机位（真实比赛视频几乎都是斜拍）
+- 写死 Windows 路径，Mac/Linux 跑不通
+- 阈值硬编码，在真实视频上静默失败（球检测率 0%）
+
+这个仓库是**完整跑通、所有 bug 都修过、Mac 优先**的版本。每个修复都记录在 [HANDOVER.md](HANDOVER.md) 里。
 
 ---
 
@@ -330,3 +352,26 @@ P3.3 数据导出 + 热力图     → 4-6 小时
 ## License
 
 代码部分 MIT。模型权重和样本视频按各自原始来源的 license 使用，仅供学习研究。
+
+---
+
+## 引用
+
+如果这个项目帮到了你的研究、论文、或产品，star 是最简单的支持方式。论文引用：
+
+```bibtex
+@misc{badminton_pipeline_repro,
+  author       = {ychenfen},
+  title        = {Badminton Match Video Analytics Pipeline},
+  year         = {2026},
+  howpublished = {\url{https://github.com/ychenfen/badminton-pipeline-repro}}
+}
+```
+
+如果你做了改进或衍生项目，欢迎提 PR / Issue / Discussion。
+
+---
+
+## 关键词
+
+羽毛球, 视频分析, 图像识别, 运动分析, 计算机视觉, 目标检测, 多目标跟踪, 球员追踪, 球轨迹, 透视变换, 单应性矩阵, 子弹时间, 慢动作, 体育数据分析, AI 教练, 羽毛球训练, 比赛复盘, 战术分析, OpenCV, PyTorch, YOLOv8, TrackNet, ByteTrack, Apple Silicon, M4 Pro, MPS, macOS, badminton, sports analytics, video analytics, computer vision, object tracking, shuttle detection, player tracking, court homography, bullet time, TrackNet, YOLOv8, ByteTrack, OpenCV, PyTorch, Apple Silicon, macOS.
