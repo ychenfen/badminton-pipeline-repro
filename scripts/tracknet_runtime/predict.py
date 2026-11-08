@@ -1,17 +1,112 @@
 import os
+import sys
 import argparse
-import numpy as np
-from tqdm import tqdm
 
-import torch
-from torch.utils.data import DataLoader
+# Enable CPU fallback for any PyTorch ops not yet implemented on Apple Silicon MPS
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-from test import predict_location, get_ensemble_weight, generate_inpaint_mask
-from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
-from utils.general import *
+_RUNTIME_DIR = os.path.dirname(os.path.abspath(__file__))
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
+try:
+    import torch
+    from torch.utils.data import DataLoader
+    from test import predict_location, get_ensemble_weight, generate_inpaint_mask
+    from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
+    from utils.general import *
+except ImportError:
+    HEIGHT = 288
+    WIDTH = 512
+    COOR_TH = (1.0 / ((HEIGHT ** 2 + WIDTH ** 2) ** 0.5)) * 50
+
+    class _DeviceStub:
+        def __init__(self, dev_type):
+            self.type = str(dev_type)
+        def __repr__(self):
+            return f"device(type='{self.type}')"
+        def __str__(self):
+            return self.type
+        def __eq__(self, other):
+            if isinstance(other, _DeviceStub):
+                return self.type == other.type
+            return self.type == str(other)
+
+    class _CudaStub:
+        @staticmethod
+        def is_available():
+            return False
+
+    class _MpsStub:
+        @staticmethod
+        def is_available():
+            return sys.platform == "darwin"
+        @staticmethod
+        def is_built():
+            return sys.platform == "darwin"
+
+    class _BackendsStub:
+        mps = _MpsStub()
+
+    class _TorchStub:
+        device = _DeviceStub
+        cuda = _CudaStub()
+        backends = _BackendsStub()
+        @staticmethod
+        def is_tensor(obj):
+            return False
+
+    torch = _TorchStub()
+    DataLoader = None
 
 
-def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
+def resolve_device(device_arg='auto'):
+    """Resolve inference device with Apple Silicon MPS support."""
+    if device_arg == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return torch.device('mps')
+        else:
+            return torch.device('cpu')
+    return torch.device(device_arg)
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--video_file', type=str, help='file path of the video')
+    parser.add_argument('--tracknet_file', type=str, help='file path of the TrackNet model checkpoint')
+    parser.add_argument('--inpaintnet_file', type=str, default='', help='file path of the InpaintNet model checkpoint')
+    parser.add_argument('--batch_size', type=int, default=16, help='batch size for inference')
+    parser.add_argument('--eval_mode', type=str, default='weight', choices=['nonoverlap', 'average', 'weight'], help='evaluation mode')
+    parser.add_argument('--max_sample_num', type=int, default=1800, help='maximum number of frames to sample for generating median image')
+    parser.add_argument('--video_range', type=lambda splits: [int(s) for s in splits.split(',')], default=None, help='range of start second and end second of the video for generating median image')
+    parser.add_argument('--save_dir', type=str, default='pred_result', help='directory to save the prediction result')
+    parser.add_argument('--large_video', action='store_true', default=False, help='whether to process large video')
+    parser.add_argument('--output_video', action='store_true', default=False, help='whether to output video with predicted trajectory')
+    parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda', 'mps'], help='inference device')
+    parser.add_argument(
+        '--vis_thresh',
+        type=float,
+        default=float(os.environ.get("TRACKNET_VIS_THRESH", "0.15")),
+        help='heatmap binary threshold for shuttle visibility (default: TRACKNET_VIS_THRESH or 0.15)',
+    )
+    return parser
+
+
+def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1), vis_thresh=None):
     """ Predict coordinates from heatmap or inpainted coordinates. 
 
         Args:
@@ -19,6 +114,7 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
             y_pred (torch.Tensor, optional): predicted heatmap sequence with shape (N, L, H, W)
             c_pred (torch.Tensor, optional): predicted inpainted coordinates sequence with shape (N, L, 2)
             img_scaler (Tuple): image scaler (w_scaler, h_scaler)
+            vis_thresh (float, optional): binary threshold for heatmap visibility
 
         Returns:
             pred_dict (Dict): dictionary of predicted coordinates
@@ -28,11 +124,11 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
     pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
 
     batch_size, seq_len = indices.shape[0], indices.shape[1]
-    indices = indices.detach().cpu().numpy()if torch.is_tensor(indices) else indices.numpy()
+    indices = indices.detach().cpu().numpy() if torch.is_tensor(indices) else (indices.numpy() if hasattr(indices, 'numpy') else indices)
     
     # Transform input for heatmap prediction
     if y_pred is not None:
-        thresh = float(os.environ.get("TRACKNET_VIS_THRESH", "0.2"))
+        thresh = float(vis_thresh) if vis_thresh is not None else float(os.environ.get("TRACKNET_VIS_THRESH", "0.15"))
         y_pred = y_pred > thresh
         y_pred = y_pred.detach().cpu().numpy() if torch.is_tensor(y_pred) else y_pred
         y_pred = to_img_format(y_pred) # (N, L, H, W)
@@ -69,23 +165,20 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
     
     return pred_dict    
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--video_file', type=str, help='file path of the video')
-    parser.add_argument('--tracknet_file', type=str, help='file path of the TrackNet model checkpoint')
-    parser.add_argument('--inpaintnet_file', type=str, default='', help='file path of the InpaintNet model checkpoint')
-    parser.add_argument('--batch_size', type=int, default=16, help='batch size for inference')
-    parser.add_argument('--eval_mode', type=str, default='weight', choices=['nonoverlap', 'average', 'weight'], help='evaluation mode')
-    parser.add_argument('--max_sample_num', type=int, default=1800, help='maximum number of frames to sample for generating median image')
-    parser.add_argument('--video_range', type=lambda splits: [int(s) for s in splits.split(',')], default=None, help='range of start second and end second of the video for generating median image')
-    parser.add_argument('--save_dir', type=str, default='pred_result', help='directory to save the prediction result')
-    parser.add_argument('--large_video', action='store_true', default=False, help='whether to process large video')
-    parser.add_argument('--output_video', action='store_true', default=False, help='whether to output video with predicted trajectory')
-    parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
-    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'], help='inference device')
+    parser = build_arg_parser()
     args = parser.parse_args()
 
-    num_workers = args.batch_size if args.batch_size <= 16 else 16
+    device = resolve_device(args.device)
+    print(f'Use device: {device} (vis_thresh={args.vis_thresh})')
+
+    # Force num_workers = 0 on MPS to prevent macOS Metal multiprocessing deadlocks
+    if device.type == 'mps':
+        num_workers = 0
+    else:
+        num_workers = args.batch_size if args.batch_size <= 16 else 16
+
     video_file = args.video_file
     video_name = os.path.splitext(os.path.basename(video_file))[0]
     video_range = args.video_range if args.video_range else None
@@ -95,12 +188,6 @@ if __name__ == '__main__':
 
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
-    
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(args.device)
-    print(f'Use device: {device}')
 
     # Load model
     tracknet_ckpt = torch.load(args.tracknet_file, map_location=device, weights_only=False)
@@ -148,7 +235,7 @@ if __name__ == '__main__':
                 y_pred = tracknet(x).detach().cpu()
             
             # Predict
-            tmp_pred = predict(i, y_pred=y_pred, img_scaler=img_scaler)
+            tmp_pred = predict(i, y_pred=y_pred, img_scaler=img_scaler, vis_thresh=args.vis_thresh)
             for key in tmp_pred.keys():
                 tracknet_pred_dict[key].extend(tmp_pred[key])
     else:
@@ -209,7 +296,7 @@ if __name__ == '__main__':
                         ensemble_y_pred = torch.cat((ensemble_y_pred, y_pred.reshape(1, 1, HEIGHT, WIDTH)), dim=0)
 
             # Predict
-            tmp_pred = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler)
+            tmp_pred = predict(ensemble_i, y_pred=ensemble_y_pred, img_scaler=img_scaler, vis_thresh=args.vis_thresh)
             for key in tmp_pred.keys():
                 tracknet_pred_dict[key].extend(tmp_pred[key])
 
@@ -240,7 +327,7 @@ if __name__ == '__main__':
                 coor_inpaint[th_mask] = 0.
                 
                 # Predict
-                tmp_pred = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler)
+                tmp_pred = predict(i, c_pred=coor_inpaint, img_scaler=img_scaler, vis_thresh=args.vis_thresh)
                 for key in tmp_pred.keys():
                     inpaint_pred_dict[key].extend(tmp_pred[key])
                 
@@ -301,7 +388,7 @@ if __name__ == '__main__':
                 ensemble_coor_inpaint[th_mask] = 0.
 
                 # Predict
-                tmp_pred = predict(ensemble_i, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler)
+                tmp_pred = predict(ensemble_i, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler, vis_thresh=args.vis_thresh)
                 for key in tmp_pred.keys():
                     inpaint_pred_dict[key].extend(tmp_pred[key])
                 

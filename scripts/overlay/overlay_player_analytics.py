@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import math
 import os
 import time
@@ -902,15 +903,26 @@ def run(args):
         cap.release()
         raise RuntimeError(f"Cannot open output writer: {args.output_path}")
 
-    model = YOLO(args.yolo_model)
+    video_stem = os.path.splitext(os.path.basename(args.video_path))[0]
+    cache_path = os.path.join(args.cache_dir, f"{video_stem}_yolo.json") if args.cache_dir else ""
+    cached_detections = None
+    detections_to_cache = {}
+    if args.use_cache and cache_path and os.path.exists(cache_path):
+        print(f"[INFO] loading cached YOLO detections from {cache_path}")
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cached_detections = json.load(f)
+        model = None
+    else:
+        model = YOLO(args.yolo_model)
 
     near_trail = deque(maxlen=args.trail_len)
     far_trail = deque(maxlen=args.trail_len)
     near_map_hist = deque(maxlen=args.minimap_trail_len)
     far_map_hist = deque(maxlen=args.minimap_trail_len)
     ball_map_hist = deque(maxlen=args.minimap_trail_len)
+    analytics_frames = []
 
-    if args.draw_ball_on_minimap:
+    if args.draw_ball_on_minimap or args.export_json or args.ball_csv:
         ball_csv = args.ball_csv if args.ball_csv else infer_ball_csv(args.video_path)
         ball_dict = load_ball_dict(ball_csv)
     else:
@@ -969,37 +981,61 @@ def run(args):
         do_detect = (frame_idx == 0) or (frame_idx % max(1, args.detect_interval) == 0)
         results = []
         roi_ox, roi_oy = 0, 0
+        raw_boxes, raw_ids, raw_kpts_xy, raw_kpts_conf = None, None, None, None
         if do_detect:
             detect_frame = frame[detect_y1:detect_y2, detect_x1:detect_x2]
-            if detect_frame.size == 0:
-                detect_frame = frame
-            else:
+            if detect_frame.size != 0:
                 roi_ox, roi_oy = detect_x1, detect_y1
-            results = model.track(
-                source=detect_frame,
-                persist=True,
-                tracker=args.tracker_cfg,
-                classes=[0],
-                conf=args.conf_thres,
-                verbose=False,
-                imgsz=args.imgsz,
-                device=args.device if args.device else None,
-                half=args.half,
-            )
-            detect_calls += 1
+            else:
+                detect_frame = frame
+
+            if cached_detections is not None:
+                frame_cache = cached_detections.get(str(frame_idx))
+                if frame_cache and len(frame_cache.get("ids", [])) > 0:
+                    raw_boxes = np.array(frame_cache["boxes"], dtype=np.float32)
+                    raw_ids = np.array(frame_cache["ids"], dtype=int)
+                    if frame_cache.get("kpts_xy") is not None:
+                        raw_kpts_xy = np.array(frame_cache["kpts_xy"], dtype=np.float32)
+                    if frame_cache.get("kpts_conf") is not None:
+                        raw_kpts_conf = np.array(frame_cache["kpts_conf"], dtype=np.float32)
+                detect_calls += 1
+            else:
+                results = model.track(
+                    source=detect_frame,
+                    persist=True,
+                    tracker=args.tracker_cfg,
+                    classes=[0],
+                    conf=args.conf_thres,
+                    verbose=False,
+                    imgsz=args.imgsz,
+                    device=args.device if args.device else None,
+                    half=args.half,
+                )
+                detect_calls += 1
+                if len(results) > 0:
+                    r = results[0]
+                    if r.boxes is not None and r.boxes.id is not None and len(r.boxes.id) > 0:
+                        raw_boxes = r.boxes.xyxy.cpu().numpy()
+                        raw_ids = r.boxes.id.cpu().numpy().astype(int)
+                        if args.draw_pose and r.keypoints is not None and r.keypoints.xy is not None:
+                            raw_kpts_xy = r.keypoints.xy.cpu().numpy()
+                            if r.keypoints.conf is not None:
+                                raw_kpts_conf = r.keypoints.conf.cpu().numpy()
+                if cache_path:
+                    detections_to_cache[str(frame_idx)] = {
+                        "boxes": raw_boxes.tolist() if raw_boxes is not None else [],
+                        "ids": raw_ids.tolist() if raw_ids is not None else [],
+                        "kpts_xy": raw_kpts_xy.tolist() if raw_kpts_xy is not None else None,
+                        "kpts_conf": raw_kpts_conf.tolist() if raw_kpts_conf is not None else None,
+                    }
 
         candidates = []
-        if len(results) > 0:
-            r = results[0]
-            if r.boxes is not None and r.boxes.id is not None and len(r.boxes.id) > 0:
-                boxes = r.boxes.xyxy.cpu().numpy()
-                ids = r.boxes.id.cpu().numpy().astype(int)
-                kpts_xy = None
-                kpts_conf = None
-                if args.draw_pose and r.keypoints is not None and r.keypoints.xy is not None:
-                    kpts_xy = r.keypoints.xy.cpu().numpy()
-                    if r.keypoints.conf is not None:
-                        kpts_conf = r.keypoints.conf.cpu().numpy()
+        if raw_boxes is not None and raw_ids is not None and len(raw_ids) > 0:
+            if True:
+                boxes = raw_boxes
+                ids = raw_ids
+                kpts_xy = raw_kpts_xy
+                kpts_conf = raw_kpts_conf
 
                 for idx, (box, tid) in enumerate(zip(boxes, ids)):
                     x1, y1, x2, y2 = box
@@ -1216,13 +1252,44 @@ def run(args):
             frame,
             far_m_for_map,
             near_m_for_map,
-            ball_m_for_map,
+            ball_m_for_map if args.draw_ball_on_minimap else None,
             far_map_hist,
             near_map_hist,
             ball_map_hist,
             args.court_width_m,
             args.court_length_m,
         )
+
+        if args.export_json:
+            vis_b, bx_b, by_b = ball_dict.get(frame_idx, (0, 0, 0))
+            analytics_frames.append(
+                {
+                    "frame": int(frame_idx),
+                    "time_sec": round(frame_idx / max(fps, 1e-6), 3),
+                    "rally_id": int(rally_idx),
+                    "near": {
+                        "court_m": [round(near_m_for_map[0], 3), round(near_m_for_map[1], 3)] if near_m_for_map is not None else None,
+                        "foot_px": [int(near_draw_pt[0]), int(near_draw_pt[1])] if near_draw_pt is not None else None,
+                        "speed_mps": round(near_stats.current_speed, 3),
+                        "rally_distance_m": round(near_stats.rally_distance, 3),
+                        "rally_max_speed_mps": round(near_stats.rally_max_speed, 3),
+                        "total_distance_m": round(near_stats.total_distance, 3),
+                    },
+                    "far": {
+                        "court_m": [round(far_m_for_map[0], 3), round(far_m_for_map[1], 3)] if far_m_for_map is not None else None,
+                        "foot_px": [int(far_draw_pt[0]), int(far_draw_pt[1])] if far_draw_pt is not None else None,
+                        "speed_mps": round(far_stats.current_speed, 3),
+                        "rally_distance_m": round(far_stats.rally_distance, 3),
+                        "rally_max_speed_mps": round(far_stats.rally_max_speed, 3),
+                        "total_distance_m": round(far_stats.total_distance, 3),
+                    },
+                    "ball": {
+                        "visible": int(vis_b),
+                        "px": [int(bx_b), int(by_b)] if vis_b > 0 else None,
+                        "court_m": [round(ball_m_for_map[0], 3), round(ball_m_for_map[1], 3)] if ball_m_for_map is not None else None,
+                    },
+                }
+            )
 
         if near_player_draw is not None:
             draw_player(frame, near_player_draw, ZH_BOTTOM, args.near_color, args.draw_foot_point, args.draw_id, args.draw_pose)
@@ -1249,6 +1316,41 @@ def run(args):
 
     cap.release()
     writer.release()
+
+    if cached_detections is None and cache_path and len(detections_to_cache) > 0:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(detections_to_cache, f)
+        print(f"[DONE] cached YOLO detections: {cache_path}")
+
+    if args.export_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.export_json)), exist_ok=True)
+        export_payload = {
+            "video_path": args.video_path,
+            "fps": round(float(fps), 3),
+            "total_frames": int(frame_idx),
+            "court_width_m": float(args.court_width_m),
+            "court_length_m": float(args.court_length_m),
+            "court_quad": court_quad.astype(float).tolist(),
+            "summary": {
+                "total_rallies": int(rally_idx),
+                "near": {
+                    "total_distance_m": round(near_stats.total_distance, 3),
+                    "max_speed_mps": round(near_stats.total_max_speed, 3),
+                    "avg_speed_mps": round(near_stats.total_avg_speed, 3),
+                },
+                "far": {
+                    "total_distance_m": round(far_stats.total_distance, 3),
+                    "max_speed_mps": round(far_stats.total_max_speed, 3),
+                    "avg_speed_mps": round(far_stats.total_avg_speed, 3),
+                },
+            },
+            "frames": analytics_frames,
+        }
+        with open(args.export_json, "w", encoding="utf-8") as f:
+            json.dump(export_payload, f, indent=2, ensure_ascii=False)
+        print(f"[DONE] exported analytics JSON: {args.export_json}")
+
     if frame_idx > 0:
         detect_ratio = detect_calls / float(frame_idx)
         print(f"[DONE] detect_calls={detect_calls}, detect_ratio={detect_ratio:.3f}")
@@ -1333,6 +1435,9 @@ def build_arg_parser():
     p.add_argument("--reset_missing_frames", type=int, default=36)
     p.add_argument("--max_flow_move", type=float, default=45.0)
     p.add_argument("--max_frames", type=int, default=0)
+    p.add_argument("--export_json", type=str, default="", help="Export per-frame player/ball court analytics to JSON")
+    p.add_argument("--cache_dir", type=str, default="", help="Directory to cache/reuse YOLO pose detections JSON")
+    p.add_argument("--use_cache", action="store_true", help="Reuse cached YOLO detections from --cache_dir if available")
     return p
 
 

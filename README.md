@@ -10,9 +10,19 @@
 
 把一段普通的羽毛球比赛视频，转换成带**运动员轨迹、移动速度、累计跑动距离、羽毛球飞行轨迹**的可视化分析视频，最后还能加上电影级"子弹时间"特效。
 
-整套系统基于 **TrackNet（球检测） + YOLOv8s-pose（球员姿态） + ByteTrack（多目标跟踪） + 透视矫正**，在 Apple Silicon Mac 上跑通过完整流程。
+整套系统基于 **TrackNet（球检测，支持 Apple Silicon MPS GPU 加速） + 2D 卡尔曼轨迹平滑 + RallyDetector（回合分割与击球检测） + YOLOv8s-pose（球员姿态） + ByteTrack（多目标跟踪） + 透视矫正 + BWF 球场热力图**，在 Apple Silicon Mac 上跑通过完整流程。
 
 ![效果演示](docs/images/demo.gif)
+
+---
+
+## v1.1.0 更新亮点
+
+- **TrackNet 原生 Apple Silicon MPS GPU 加速**：`predict.py` 支持 `--device mps`（`--device auto` 自动识别 CUDA / MPS / CPU）与 `--vis_thresh 0.15` 参数，全长比赛视频推理从 ~3 小时（CPU）缩短至 ~25-30 分钟。
+- **`RallyDetector` 自动回合分割 + 击球检测 + FFmpeg 集锦剪辑**（`scripts/tools/rally_detector.py`）：可作为 Python 类直接 `from scripts.tools.rally_detector import RallyDetector` 导入或 CLI 运行，输出 `[start_frame, end_frame]` 回合边界、击球帧序列、`rallies.json` / `rallies.csv`，并支持一键调用 FFmpeg 切出 `rally_XX.mp4` 与 `highlights.mp4`。
+- **羽毛球轨迹插值与 2D 卡尔曼滤波平滑**（`scripts/tools/smooth_ball_csv.py`）：纯 NumPy 实现四状态 `[x, y, vx, vy]` 卡尔曼滤波 + RTS 平滑，自动补齐短漏检空洞（`<= 8` 帧）并保留长非比赛区间。
+- **结构化 JSON 导出与 BWF 球场热力图**（`overlay_player_analytics.py --export_json` + `scripts/tools/heatmap.py`）：导出逐帧球员/羽毛球米制球场坐标、速度、距离及 YOLO 检测缓存（`--cache_dir`），并生成双面板出版级 `court_heatmap.png`（左：球场覆盖热力图；右：击球/落点散点图）。
+- **根目录标准 MIT `LICENSE` 与单元测试套件**（`tests/test_v1_1_tools.py`）。
 
 ---
 
@@ -109,21 +119,31 @@ python3 scripts/tools/select_court.py short.mp4
 
 ![球场角点标注](docs/images/02_court_corners.jpg)
 
-### 4. 一键跑通三段
+### 4. 一键跑通三段（含轨迹平滑、回合检测与球场热力图）
 
 ```bash
-TRACKNET_VIS_THRESH=0.15 ./run_all_mac.sh \
+./run_all_mac.sh \
   --input-video short.mp4 \
-  --court-points "352,342,628,343,944,527,52,532" \
-  --yolo-device mps
+  --tracknet-device auto \
+  --eval-mode nonoverlap \
+  --yolo-device mps \
+  --smooth-ball \
+  --detect-rallies \
+  --export-heatmap
 ```
 
 参数含义：
-- `TRACKNET_VIS_THRESH=0.15` — TrackNet 二值化阈值，**必须设**（默认 0.5 会让球检测率降到 0%，详见下文 §6）
+- `--tracknet-device auto` — TrackNet 自动启用 Apple Silicon `mps` / NVIDIA `cuda` 加速（且默认内置 `TRACKNET_VIS_THRESH=0.15` 与 `short.mp4` 球场角点，无需手动传环境变量）
+- `--eval-mode nonoverlap` — 非重叠滑窗推理，速度提升约 8 倍
 - `--yolo-device mps` — YOLOv8 走 M 系列芯片 GPU 加速
+- `--smooth-ball` — 运行 `smooth_ball_csv.py` 对球轨迹做空洞插值与 2D 卡尔曼平滑
+- `--detect-rallies` — 运行 `rally_detector.py` 输出 `rallies.json` 与 `rallies.csv`
+- `--export-heatmap` — 导出 `analytics.json` 并生成双面板 `court_heatmap.png`
 
 跑完输出在 `~/yumaoqiu_repro/`：
-- `tracknet_v3_result_regen/short_ball.csv` — 球的逐帧坐标
+- `tracknet_v3_result_regen/short_ball.csv` & `short_ball_smoothed.csv` — 球的原始与平滑后逐帧坐标
+- `rallies.json` & `rallies.csv` — 自动回合起止帧与击球点分析报告
+- `analytics.json` & `court_heatmap.png` — 逐帧米制球场坐标数据与 BWF 球场覆盖热力图
 - `end1_fix_swap2_precision_full_regen.mp4` — 叠加分析的视频
 - `end1_fix_swap2_precision_full_fx_regen.mp4` — 加了子弹时间特效的最终成品
 
@@ -227,13 +247,54 @@ H, _ = cv2.findHomography(court_quad, dst_rectangle)
 
 ### 全长视频时间预估（M4 Pro）
 
-| 阶段 | CPU | MPS（GPU） |
+| 阶段 | CPU | MPS（GPU，v1.1.0 已原生支持） |
 |---|---|---|
-| TrackNet（13344 帧） | ~3 小时 | 暂不支持，需改代码 |
-| Overlay | ~30 分钟 | ~10 分钟 |
+| TrackNet（13344 帧） | ~3 小时 | **~25–30 分钟**（`--device mps` / `auto`） |
+| Overlay | ~30 分钟 | ~10 分钟（配合 `--cache_dir` 二次运行仅需 ~30 秒） |
 | FX | ~5 分钟 | 同上 |
 
-**最大瓶颈是 TrackNet**，用 PyTorch MPS 后端能压到 30 分钟。改造方案见 [HANDOVER.md](HANDOVER.md) §10 Task P1.1。
+---
+
+## 独立分析工具（v1.1.0 新增）
+
+### 1. `RallyDetector`：自动回合分割 + 击球检测 + FFmpeg 批量切视频
+
+```bash
+python3 scripts/tools/rally_detector.py \
+  --ball_csv ~/yumaoqiu_repro/tracknet_v3_result_regen/short_ball.csv \
+  --fps 21.0 \
+  --min_rally_frames 30 \
+  --max_missing_frames 25 \
+  --cut_video short.mp4 \
+  --out_dir ~/yumaoqiu_repro/rallies
+```
+
+也可在 Python 中直接导入复用：
+
+```python
+from scripts.tools.rally_detector import RallyDetector
+
+detector = RallyDetector(fps=21.0, min_rally_frames=30, max_missing_frames=25)
+rallies = detector.detect_from_csv("short_ball.csv")
+boundaries = detector.get_boundaries()  # [(start_frame, end_frame), ...]
+```
+
+### 2. `smooth_ball_csv.py`：羽毛球轨迹补漏与 2D 卡尔曼平滑
+
+```bash
+python3 scripts/tools/smooth_ball_csv.py \
+  ~/yumaoqiu_repro/tracknet_v3_result_regen/short_ball.csv \
+  --output ~/yumaoqiu_repro/tracknet_v3_result_regen/short_ball_smoothed.csv \
+  --max_gap 8
+```
+
+### 3. `heatmap.py`：BWF 球场覆盖热力图与击球散点图
+
+```bash
+python3 scripts/tools/heatmap.py \
+  ~/yumaoqiu_repro/analytics.json \
+  --output ~/yumaoqiu_repro/court_heatmap.png
+```
 
 ---
 
@@ -295,7 +356,11 @@ badminton-pipeline-repro/
     ├── fx/
     │   └── video_fx_bullet_time.py       # Step 3: 特效
     │
-    └── tools/                      # 调试工具
+    └── tools/                      # 分析与调试工具
+        ├── README.md               # 工具集详细说明
+        ├── rally_detector.py       # 自动回合分割 + 击球检测 + FFmpeg 剪辑
+        ├── smooth_ball_csv.py      # 球轨迹空洞插值 + 2D 卡尔曼滤波
+        ├── heatmap.py              # BWF 标准球场覆盖热力图与落点散点图
         ├── select_court.py         # 交互式标球场角点
         ├── diag_tracknet.py        # 诊断 TrackNet heatmap 强度
         └── render_panel_preview.py # 单独渲染面板预览

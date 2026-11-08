@@ -10,9 +10,19 @@
 
 End-to-end pipeline that turns a regular badminton match video into an analytics overlay: **player trajectories, movement speed, accumulated distance, shuttle flight path**, plus optional bullet-time effects.
 
-Built on **TrackNet (shuttle detection) + YOLOv8s-pose (player keypoints) + ByteTrack (ID tracking) + court homography**. Tested end-to-end on Apple Silicon (M4 Pro).
+Built on **TrackNet (shuttle detection with native Apple Silicon MPS GPU acceleration) + 2D Kalman trajectory smoothing + RallyDetector (auto rally segmentation & hit detection) + YOLOv8s-pose (player keypoints) + ByteTrack (ID tracking) + court homography + BWF court heatmaps**. Tested end-to-end on Apple Silicon (M4 Pro).
 
 ![demo](docs/images/demo.gif)
+
+---
+
+## What's New in v1.1.0
+
+- **Native Apple Silicon MPS GPU Acceleration for TrackNet** (`scripts/tracknet_runtime/predict.py`): `--device auto` now automatically selects `cuda`, `mps`, or `cpu`, and `--vis_thresh` defaults to `0.15` so users never hit 0% recall if they forget the environment variable. Full-match inference drops from ~3 hours (CPU) to ~25–30 minutes on M-series Macs.
+- **`RallyDetector` + Hit Detection + FFmpeg Batch Clipper** (`scripts/tools/rally_detector.py`): Importable `RallyDetector` class and CLI tool that segments `[start_frame, end_frame]` rally boundaries, detects racket hit frames, exports `rallies.json` & `rallies.csv`, and slices `rally_XX.mp4` + `highlights.mp4` via FFmpeg.
+- **Shuttle Trajectory Gap Interpolation & 2D Kalman Smoothing** (`scripts/tools/smooth_ball_csv.py`): Pure-NumPy 4-state `[x, y, vx, vy]` constant-velocity Kalman filter + RTS smoother that interpolates short occlusion gaps (`<= 8` frames) while preserving true out-of-play intervals.
+- **Analytics JSON Export & BWF Court Heatmap** (`overlay_player_analytics.py --export_json` & `scripts/tools/heatmap.py`): Exports per-frame player/shuttle real-world court coordinates (`analytics.json`), caches YOLO detections (`--cache_dir`), and renders a 2-panel publication-grade `court_heatmap.png` (Panel 1: Player Court Coverage / Shuttle Density Heatmap; Panel 2: Shuttle Hit/Landing Scatter Plot on a 6.1m x 13.4m BWF court).
+- **Root MIT `LICENSE` & Unit Test Suite** (`tests/test_v1_1_tools.py`).
 
 ---
 
@@ -91,21 +101,27 @@ For the included `short.mp4`:
 
 ![court corners](docs/images/02_court_corners.jpg)
 
-### 4. Run all three stages
+### 4. Run all three stages (with smoothing, rally detection & court heatmap)
 
 ```bash
-TRACKNET_VIS_THRESH=0.15 ./run_all_mac.sh \
+./run_all_mac.sh \
   --input-video short.mp4 \
-  --court-points "352,342,628,343,944,527,52,532" \
-  --yolo-device mps
+  --tracknet-device auto \
+  --eval-mode nonoverlap \
+  --yolo-device mps \
+  --smooth-ball \
+  --detect-rallies \
+  --export-heatmap
 ```
 
-Why `TRACKNET_VIS_THRESH=0.15`? The original code hardcodes a `> 0.5` threshold for ball detection that **gives 0% recall on most real videos**. Lowering to 0.15 gives ~95% recall. Full story in [HANDOVER.md §6.1.4](HANDOVER.md).
+`run_all_mac.sh` now defaults to `TRACKNET_VIS_THRESH=0.15` and the calibrated `short.mp4` court corners (`352,342,628,343,944,527,52,532`), and automatically uses Apple Silicon `mps` for TrackNet when `--tracknet-device auto` is set.
 
 ### 5. Outputs
 
 In `~/yumaoqiu_repro/`:
-- `tracknet_v3_result_regen/short_ball.csv` — per-frame ball coordinates
+- `tracknet_v3_result_regen/short_ball.csv` & `short_ball_smoothed.csv` — raw and Kalman-smoothed per-frame ball coordinates
+- `rallies.json` & `rallies.csv` — segmented rally boundaries (`[start_frame, end_frame]`) and detected hit frames
+- `analytics.json` & `court_heatmap.png` — per-frame court-meter analytics and 2-panel BWF court coverage heatmap
 - `end1_fix_swap2_precision_full_regen.mp4` — analytics overlay video
 - `end1_fix_swap2_precision_full_fx_regen.mp4` — final FX video
 
@@ -175,13 +191,54 @@ Pure post-processing on the Step 2 output, no detection involved.
 
 ## Performance (MacBook Apple M4 Pro)
 
-| Stage | CPU | MPS (GPU) |
+| Stage | CPU | MPS (GPU, supported in v1.1.0) |
 |---|---|---|
-| TrackNet (13344 frames) | ~3 hours | not yet supported, see [HANDOVER §10 P1.1](HANDOVER.md) |
-| Overlay | ~30 min | ~10 min |
+| TrackNet (13344 frames) | ~3 hours | **~25–30 min** (`--device mps` / `auto`) |
+| Overlay | ~30 min | ~10 min (~30 sec on re-runs with `--cache_dir`) |
 | FX | ~5 min | same |
 
-TrackNet is the bottleneck. Adding MPS device support is task **P1.1** in the roadmap.
+---
+
+## Standalone Analytics Tools (v1.1.0)
+
+### 1. `RallyDetector` — Auto Rally Segmentation, Hit Detection & FFmpeg Clipper
+
+```bash
+python3 scripts/tools/rally_detector.py \
+  --ball_csv ~/yumaoqiu_repro/tracknet_v3_result_regen/short_ball.csv \
+  --fps 21.0 \
+  --min_rally_frames 30 \
+  --max_missing_frames 25 \
+  --cut_video short.mp4 \
+  --out_dir ~/yumaoqiu_repro/rallies
+```
+
+Or import directly in Python:
+
+```python
+from scripts.tools.rally_detector import RallyDetector
+
+detector = RallyDetector(fps=21.0, min_rally_frames=30, max_missing_frames=25)
+rallies = detector.detect_from_csv("short_ball.csv")
+boundaries = detector.get_boundaries()  # [(start_frame, end_frame), ...]
+```
+
+### 2. `smooth_ball_csv.py` — Trajectory Interpolation & 2D Kalman Smoothing
+
+```bash
+python3 scripts/tools/smooth_ball_csv.py \
+  ~/yumaoqiu_repro/tracknet_v3_result_regen/short_ball.csv \
+  --output ~/yumaoqiu_repro/tracknet_v3_result_regen/short_ball_smoothed.csv \
+  --max_gap 8
+```
+
+### 3. `heatmap.py` — 2-Panel BWF Court Coverage Heatmap & Hit Scatter Plot
+
+```bash
+python3 scripts/tools/heatmap.py \
+  ~/yumaoqiu_repro/analytics.json \
+  --output ~/yumaoqiu_repro/court_heatmap.png
+```
 
 ---
 
@@ -211,18 +268,18 @@ More: [HANDOVER §8](HANDOVER.md).
 [HANDOVER.md §10](HANDOVER.md) lists 12 detailed tasks (P0-P3), each formatted as a self-contained brief (**background / goal / steps / files / verification / pitfalls**) so AI agents (Codex, Cursor, Claude) can pick any one and execute end-to-end.
 
 ```
-P0.1 Inline defaults into run_all_mac.sh         15 min
+P0.1 Inline defaults into run_all_mac.sh         done (v1.1.0)
 P0.2 Clean up debug artifacts                    done
 P0.3 Run full-length baseline                    3-4 h
-P1.1 TrackNet on Apple MPS                       2-4 h
-P1.2 Cache detections.json                       3-5 h
+P1.1 TrackNet on Apple MPS                       done (v1.1.0)
+P1.2 Cache detections.json                       done (v1.1.0)
 P1.3 YOLO frame-skip detection                   1-2 h
-P2.1 Ball trajectory hole-filling (Kalman)       3-4 h
-P2.2 Hit detection + auto rally split            4-6 h
+P2.1 Ball trajectory hole-filling (Kalman)       done (v1.1.0)
+P2.2 Hit detection + auto rally split            done (v1.1.0)
 P2.3 Mini Court visual polish                    1-2 h
 P3.1 Gradio Web UI                               1-2 d
 P3.2 Multi-camera angle support                  1-2 d
-P3.3 JSON export + heatmap                       4-6 h
+P3.3 JSON export + heatmap                       done (v1.1.0)
 ```
 
 ---
